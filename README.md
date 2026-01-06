@@ -19,5 +19,5 @@ conda activate medibot
 
 ### Step 02- install the requirments
 '''bash
-pip install -r requirments.txt
+pip install -r requirements.txt
 '''
