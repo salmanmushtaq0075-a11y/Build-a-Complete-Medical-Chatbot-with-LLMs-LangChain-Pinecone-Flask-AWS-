@@ -35,7 +35,7 @@ retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k":
 
 chatmodel = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    google_api_key="AIzaSyAMTF9opFqe8fYRbxpKIhWfOxl-qqPmKbY",
+    google_api_key="AIzaSyBbobAd8zgt6D_qK8BykVGj0y_2k_Oct90",
     temperature=0
 )
 
