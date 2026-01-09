@@ -1,28 +1,30 @@
-from flask import Flask, request, jsonify , render_template
-from src.helper import load_pdf_files, text_split, download_embeddings, filter_to_minimal_docs
+from flask import Flask, request, jsonify, render_template
+from src.helper import download_embeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain.chains import create_retrieval_chain
-import os
-from src.prompt import system_prompt
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from src.prompt import system_prompt
+import os
 
 app = Flask(__name__)
 
+# 1. Load Keys
 load_dotenv()
-
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
+# 2. Setup Embeddings & Index
 embeddings = download_embeddings()
-
 index_name = "medical-chatbot"
 
 docsearch = PineconeVectorStore.from_existing_index(
@@ -32,23 +34,71 @@ docsearch = PineconeVectorStore.from_existing_index(
 
 retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k":3})
 
-
+# 3. Setup Model
 chatmodel = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    google_api_key="AIzaSyBbobAd8zgt6D_qK8BykVGj0y_2k_Oct90",
+    google_api_key="AIzaSyD5jayqxAH_f-_ar1WIxmh6TdyHARa0dT4",
     temperature=0
 )
 
-prompt = ChatPromptTemplate.from_messages(
+# --- NEW MEMORY LOGIC STARTS HERE ---
+
+# A. Create a "History Aware" Retriever
+# This sub-chain rephrases the latest question given the chat history
+contextualize_q_system_prompt = (
+    "Given a chat history and the latest user question "
+    "which might reference context in the chat history, "
+    "formulate a standalone question which can be understood "
+    "without the chat history. Do NOT answer the question, "
+    "just reformulate it if needed and otherwise return it as is."
+)
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", system_prompt),
-        ("human", "{input}")
+        ("system", contextualize_q_system_prompt),
+        ("placeholder", "{chat_history}"),
+        ("human", "{input}"),
     ]
 )
 
-question_answer_chain = create_stuff_documents_chain(chatmodel, prompt)
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+history_aware_retriever = create_history_aware_retriever(
+    chatmodel, retriever, contextualize_q_prompt
+)
 
+# B. Create the Answer Chain (QA)
+# This chain actually answers the question using the docs
+qa_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", system_prompt),
+        ("placeholder", "{chat_history}"), # <--- History goes here
+        ("human", "{input}"),
+    ]
+)
+
+question_answer_chain = create_stuff_documents_chain(chatmodel, qa_prompt)
+
+# C. Combine them into the RAG Chain
+rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+# D. Managing Chat History State
+# We store history in a simple dictionary for this demo
+store = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+# E. The Final Chain with Automatic History Management
+conversational_rag_chain = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer",
+)
+
+# --- ROUTES ---
 
 @app.route("/")
 def index():
@@ -58,11 +108,19 @@ def index():
 def chat():
     msg = request.form["msg"]
     input = msg
-    print(input)
-    response = rag_chain.invoke({"input": msg})
+    print(f"User Input: {input}")
+    
+    # We use a static session ID for simplicity in this demo.
+    # In a real app with login, this would be the user's ID.
+    session_id = "default_user_session"
+    
+    response = conversational_rag_chain.invoke(
+        {"input": msg},
+        config={"configurable": {"session_id": session_id}}
+    )
+    
     print("Response:", response["answer"])
-    return str (response["answer"])
+    return str(response["answer"])
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0",port=5000 ,debug=True)
-
+    app.run(host="0.0.0.0", port=5000, debug=True)

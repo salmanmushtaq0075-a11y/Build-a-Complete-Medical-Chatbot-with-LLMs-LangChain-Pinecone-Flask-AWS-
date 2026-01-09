@@ -1,0 +1,92 @@
+name: Build and Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allows manual triggering from GitHub UI
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+  CONTAINER_NAME: medibot-container
+
+jobs:
+  # JOB 1: BUILD & PUSH TO AWS ECR
+  build-and-push:
+    runs-on: ubuntu-latest  # Runs on GitHub's powerful servers
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: latest
+      run: |
+        # Build the Docker image
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        
+        # Push the image to ECR
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # JOB 2: DEPLOY TO EC2 (Self-Hosted Runner)
+  deploy:
+    needs: build-and-push
+    runs-on: self-hosted  # Runs on YOUR EC2 instance
+    
+    steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Pull and Run Docker Container
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: latest
+        PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      run: |
+        # 1. Pull the latest image from ECR
+        docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # 2. Stop and Remove any existing container with the same name
+        docker stop $CONTAINER_NAME || true
+        docker rm $CONTAINER_NAME || true
+        
+        # 3. Run the new container
+        # We pass the API keys as environment variables here so they aren't hardcoded
+        docker run -d -p 5000:5000 --name $CONTAINER_NAME \
+          -e PINECONE_API_KEY="${PINECONE_API_KEY}" \
+          -e GOOGLE_API_KEY="${GOOGLE_API_KEY}" \
+          $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Clean up unused images
+      run: |
+        # Frees up space on your t3.micro instance
+        docker image prune -f
